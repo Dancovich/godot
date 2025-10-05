@@ -30,35 +30,29 @@
 
 #pragma once
 
-#include "core/string/ustring.h"
-#include "core/templates/hash_map.h"
-#include "core/templates/list.h"
-#include "core/variant/array.h"
+#include "core/object/object.h"
 #include "servers/display/display_server.h"
 
-#include <objbase.h>
-#include <sapi.h>
-#include <winnls.h>
-#include <cwchar>
+#include <winrt/windows.media.playback.h>
+#include <winrt/windows.media.speechsynthesis.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+using namespace winrt;
+using namespace Windows::Media::SpeechSynthesis;
+using namespace Windows::Media::Playback;
 
 class TTS_Windows {
-	List<DisplayServer::TTSUtterance> queue;
-	ISpVoice *synth = nullptr;
+private:
+	const int NO_UTTERANCE_ID = std::numeric_limits<int>::min();
+
 	bool paused = false;
-	struct UTData {
-		Char16String string;
-		int offset;
-		int id;
-	};
-	HashMap<uint32_t, UTData> ids;
-	bool update_requested = false;
-
-	static void __stdcall speech_event_callback(WPARAM wParam, LPARAM lParam);
-
 	static TTS_Windows *singleton;
+	int pending_utterance_id = NO_UTTERANCE_ID;
+
+	SpeechSynthesizer synthesizer;
+	MediaPlayer media_player;
+	List<DisplayServer::TTSUtterance> queue;
+
+	bool is_ssml(DisplayServer::TTSUtterance &message) const;
 
 public:
 	static TTS_Windows *get_singleton();
@@ -71,7 +65,6 @@ public:
 	void pause();
 	void resume();
 	void stop();
-
 	void process_events();
 
 	TTS_Windows();

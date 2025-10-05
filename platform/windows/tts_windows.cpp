@@ -30,164 +30,51 @@
 
 #include "tts_windows.h"
 
+#include <winrt/windows.foundation.collections.h>
+#include <winrt/windows.foundation.h>
+#include <winrt/windows.media.core.h>
+
+using namespace Windows::Foundation;
+using namespace Windows::Foundation::Collections;
+using namespace Windows::Media::Core;
+
 TTS_Windows *TTS_Windows::singleton = nullptr;
 
-void __stdcall TTS_Windows::speech_event_callback(WPARAM wParam, LPARAM lParam) {
-	TTS_Windows *tts = TTS_Windows::get_singleton();
-	SPEVENT event;
-	while (tts->synth->GetEvents(1, &event, nullptr) == S_OK) {
-		uint32_t stream_num = (uint32_t)event.ulStreamNum;
-		if (tts->ids.has(stream_num)) {
-			if (event.eEventId == SPEI_START_INPUT_STREAM) {
-				DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_STARTED, tts->ids[stream_num].id);
-			} else if (event.eEventId == SPEI_END_INPUT_STREAM) {
-				DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_ENDED, tts->ids[stream_num].id);
-				tts->ids.erase(stream_num);
-				tts->update_requested = true;
-			} else if (event.eEventId == SPEI_WORD_BOUNDARY) {
-				const Char16String &string = tts->ids[stream_num].string;
-				int pos = 0;
-				for (int i = 0; i < MIN(event.lParam, string.length()); i++) {
-					char16_t c = string[i];
-					if ((c & 0xfffffc00) == 0xd800) {
-						i++;
-					}
-					pos++;
-				}
-				DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_BOUNDARY, tts->ids[stream_num].id, pos - tts->ids[stream_num].offset);
-			}
-		}
-	}
-}
-
-void TTS_Windows::process_events() {
-	if (update_requested && !paused && queue.size() > 0 && !is_speaking()) {
-		DisplayServer::TTSUtterance &message = queue.front()->get();
-
-		String text;
-		DWORD flags = SPF_ASYNC | SPF_PURGEBEFORESPEAK | SPF_IS_XML;
-		String pitch_tag = String("<pitch absmiddle=\"") + String::num_int64(message.pitch * 10 - 10, 10) + String("\">");
-		text = pitch_tag + message.text + String("</pitch>");
-
-		IEnumSpObjectTokens *cpEnum;
-		ISpObjectToken *cpVoiceToken;
-		ULONG ulCount = 0;
-		ULONG stream_number = 0;
-		ISpObjectTokenCategory *cpCategory;
-		HRESULT hr = CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_INPROC_SERVER, IID_ISpObjectTokenCategory, (void **)&cpCategory);
-		if (SUCCEEDED(hr)) {
-			hr = cpCategory->SetId(SPCAT_VOICES, false);
-			if (SUCCEEDED(hr)) {
-				hr = cpCategory->EnumTokens(nullptr, nullptr, &cpEnum);
-				if (SUCCEEDED(hr)) {
-					hr = cpEnum->GetCount(&ulCount);
-					while (SUCCEEDED(hr) && ulCount--) {
-						wchar_t *w_id = nullptr;
-						hr = cpEnum->Next(1, &cpVoiceToken, nullptr);
-						cpVoiceToken->GetId(&w_id);
-						if (String::utf16((const char16_t *)w_id) == message.voice) {
-							synth->SetVoice(cpVoiceToken);
-							cpVoiceToken->Release();
-							break;
-						}
-						cpVoiceToken->Release();
-					}
-					cpEnum->Release();
-				}
-			}
-			cpCategory->Release();
-		}
-
-		UTData ut;
-		ut.string = text.utf16();
-		ut.offset = pitch_tag.length(); // Subtract injected <pitch> tag offset.
-		ut.id = message.id;
-
-		synth->SetVolume(message.volume);
-		synth->SetRate(10.f * std::log10(message.rate) / std::log10(3.f));
-		synth->Speak((LPCWSTR)ut.string.get_data(), flags, &stream_number);
-
-		ids[(uint32_t)stream_number] = ut;
-
-		queue.pop_front();
-
-		update_requested = false;
-	}
-}
-
 bool TTS_Windows::is_speaking() const {
-	ERR_FAIL_NULL_V(synth, false);
-
-	SPVOICESTATUS status;
-	synth->GetStatus(&status, nullptr);
-	return (status.dwRunningState == SPRS_IS_SPEAKING || status.dwRunningState == 0 /* Waiting To Speak */);
+	ERR_FAIL_NULL_V(media_player, false);
+	return media_player.PlaybackSession().PlaybackState() == MediaPlaybackState::Playing || pending_utterance_id != NO_UTTERANCE_ID;
 }
 
 bool TTS_Windows::is_paused() const {
-	ERR_FAIL_NULL_V(synth, false);
+	ERR_FAIL_NULL_V(media_player, false);
 	return paused;
 }
 
 Array TTS_Windows::get_voices() const {
-	Array list;
-	IEnumSpObjectTokens *cpEnum;
-	ISpObjectToken *cpVoiceToken;
-	ISpDataKey *cpDataKeyAttribs;
-	ULONG ulCount = 0;
-	ISpObjectTokenCategory *cpCategory;
-	HRESULT hr = CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_INPROC_SERVER, IID_ISpObjectTokenCategory, (void **)&cpCategory);
-	if (SUCCEEDED(hr)) {
-		hr = cpCategory->SetId(SPCAT_VOICES, false);
-		if (SUCCEEDED(hr)) {
-			hr = cpCategory->EnumTokens(nullptr, nullptr, &cpEnum);
-			if (SUCCEEDED(hr)) {
-				hr = cpEnum->GetCount(&ulCount);
-				while (SUCCEEDED(hr) && ulCount--) {
-					hr = cpEnum->Next(1, &cpVoiceToken, nullptr);
-					HRESULT hr_attr = cpVoiceToken->OpenKey(SPTOKENKEY_ATTRIBUTES, &cpDataKeyAttribs);
-					if (SUCCEEDED(hr_attr)) {
-						wchar_t *w_id = nullptr;
-						wchar_t *w_lang = nullptr;
-						wchar_t *w_name = nullptr;
-						cpVoiceToken->GetId(&w_id);
-						cpDataKeyAttribs->GetStringValue(L"Language", &w_lang);
-						cpDataKeyAttribs->GetStringValue(nullptr, &w_name);
-						LCID locale = wcstol(w_lang, nullptr, 16);
+	Array voices;
 
-						int locale_chars = GetLocaleInfoW(locale, LOCALE_SISO639LANGNAME, nullptr, 0);
-						int region_chars = GetLocaleInfoW(locale, LOCALE_SISO3166CTRYNAME, nullptr, 0);
-						wchar_t *w_lang_code = new wchar_t[locale_chars];
-						wchar_t *w_reg_code = new wchar_t[region_chars];
-						GetLocaleInfoW(locale, LOCALE_SISO639LANGNAME, w_lang_code, locale_chars);
-						GetLocaleInfoW(locale, LOCALE_SISO3166CTRYNAME, w_reg_code, region_chars);
+	IVectorView<VoiceInformation> winrt_voices = synthesizer.AllVoices();
+	for (const VoiceInformation voice : winrt_voices) {
+		Dictionary new_voice = {};
 
-						Dictionary voice_d;
-						voice_d["id"] = String::utf16((const char16_t *)w_id);
-						if (w_name) {
-							voice_d["name"] = String::utf16((const char16_t *)w_name);
-						} else {
-							voice_d["name"] = voice_d["id"].operator String().replace("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\", "");
-						}
-						voice_d["language"] = String::utf16((const char16_t *)w_lang_code) + "_" + String::utf16((const char16_t *)w_reg_code);
-						list.push_back(voice_d);
+		wchar_t const *voice_id = winrt::to_hstring(voice.Id()).c_str();
+		wchar_t const *voice_name = winrt::to_hstring(voice.DisplayName()).c_str();
+		wchar_t const *voice_language = winrt::to_hstring(voice.Language()).c_str();
 
-						delete[] w_lang_code;
-						delete[] w_reg_code;
+		new_voice["id"] = String::utf16((const char16_t *)voice_id);
+		new_voice["name"] = String::utf16((const char16_t *)voice_name);
+		new_voice["language"] = String::utf16((const char16_t *)voice_language);
 
-						cpDataKeyAttribs->Release();
-					}
-					cpVoiceToken->Release();
-				}
-				cpEnum->Release();
-			}
-		}
-		cpCategory->Release();
+		voices.append(new_voice);
 	}
-	return list;
+
+	return voices;
 }
 
 void TTS_Windows::speak(const String &p_text, const String &p_voice, int p_volume, float p_pitch, float p_rate, int p_utterance_id, bool p_interrupt) {
-	ERR_FAIL_NULL(synth);
+	ERR_FAIL_NULL(synthesizer);
+	ERR_FAIL_NULL(media_player);
+
 	if (p_interrupt) {
 		stop();
 	}
@@ -208,65 +95,200 @@ void TTS_Windows::speak(const String &p_text, const String &p_voice, int p_volum
 
 	if (is_paused()) {
 		resume();
-	} else {
-		update_requested = true;
 	}
 }
 
 void TTS_Windows::pause() {
-	ERR_FAIL_NULL(synth);
+	ERR_FAIL_NULL(media_player);
+
 	if (!paused) {
-		if (synth->Pause() == S_OK) {
+		MediaPlaybackSession session = media_player.PlaybackSession();
+		if (session.CanPause()) {
+			media_player.Pause();
 			paused = true;
 		}
 	}
 }
 
 void TTS_Windows::resume() {
-	ERR_FAIL_NULL(synth);
-	synth->Resume();
-	paused = false;
+	ERR_FAIL_NULL(media_player);
+
+	if (paused && media_player.Source() != nullptr) {
+		media_player.Play();
+		paused = false;
+	}
 }
 
 void TTS_Windows::stop() {
-	ERR_FAIL_NULL(synth);
+	ERR_FAIL_NULL(media_player);
 
-	SPVOICESTATUS status;
-	synth->GetStatus(&status, nullptr);
-	uint32_t current_stream = (uint32_t)status.ulCurrentStream;
-	if (ids.has(current_stream)) {
-		DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_CANCELED, ids[current_stream].id);
-		ids.erase(current_stream);
+	MediaPlaybackSession session = media_player.PlaybackSession();
+	if (session.CanPause()) {
+		media_player.Pause();
 	}
+
 	for (DisplayServer::TTSUtterance &message : queue) {
 		DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_CANCELED, message.id);
 	}
+
 	queue.clear();
-	synth->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
-	synth->Resume();
+
+	int utterance_id = pending_utterance_id;
+	if (utterance_id != NO_UTTERANCE_ID) {
+		DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_CANCELED, utterance_id);
+		pending_utterance_id = NO_UTTERANCE_ID;
+	}
+
+	media_player.Source(nullptr);
 	paused = false;
+}
+
+void TTS_Windows::process_events() {
+	if (!paused && queue.size() > 0 && !is_speaking()) {
+		DisplayServer::TTSUtterance &message = queue.front()->get();
+
+		IVectorView<VoiceInformation> available_voices = synthesizer.AllVoices();
+		bool found_voice = false;
+		for (impl::fast_iterator<IVectorView<VoiceInformation>> iterator = available_voices.begin(); iterator != available_voices.end(); ++iterator) {
+			VoiceInformation current_voice = *iterator;
+
+			wchar_t const *voice_id_utf16 = winrt::to_hstring(current_voice.Id()).c_str();
+			if (message.voice == String::utf16((const char16_t *)voice_id_utf16)) {
+				synthesizer.Voice(current_voice);
+				found_voice = true;
+				break;
+			}
+		}
+
+		if (!found_voice) {
+			VoiceInformation default_voice = synthesizer.DefaultVoice();
+			synthesizer.Voice(default_voice);
+		}
+
+		synthesizer.Options().AudioVolume(message.volume / 100.0);
+		synthesizer.Options().AudioPitch(message.pitch);
+
+		// map rate range to WinRT range of 0.5 to 6.0
+		double playback_rate = 0.5f + ((message.rate - 0.1f) / (10.0f - 0.1f)) * (6.0f - 0.5f);
+		synthesizer.Options().SpeakingRate(playback_rate);
+
+		const char16_t *utf16_data = message.text.utf16().get_data();
+		size_t utf16_length = message.text.length();
+		hstring converted_text(reinterpret_cast<const wchar_t *>(utf16_data), utf16_length);
+
+		pending_utterance_id = message.id;
+		IAsyncOperation<SpeechSynthesisStream> synthesize_task = is_ssml(message)
+				? synthesizer.SynthesizeSsmlToStreamAsync(converted_text)
+				: synthesizer.SynthesizeTextToStreamAsync(converted_text);
+		synthesize_task.Completed([this](IAsyncOperation<SpeechSynthesisStream> const &res, AsyncStatus const status) {
+			int utterance_id = pending_utterance_id;
+			if (utterance_id == NO_UTTERANCE_ID) {
+				return;
+			}
+
+			if (media_player == nullptr) {
+				print_error("Could not synthesize text to speech - media_player != null is false");
+				DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_CANCELED, utterance_id);
+				pending_utterance_id = NO_UTTERANCE_ID;
+			} else if (status != AsyncStatus::Completed) {
+				if (status == AsyncStatus::Error) {
+					print_error(vformat("Could not synthesize text to speech - error processing text (marlfomed SSML?)"));
+				} else if (status == AsyncStatus::Canceled) {
+					print_error("Could not synthesize text to speech - operation was canceled");
+				} else {
+					print_error("Could not synthesize text to speech - unknown error");
+				}
+
+				DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_CANCELED, utterance_id);
+				pending_utterance_id = NO_UTTERANCE_ID;
+			} else {
+				SpeechSynthesisStream generated_stream = res.GetResults();
+
+				MediaSource source = MediaSource::CreateFromStream(generated_stream, L"Audio");
+				MediaPlaybackItem media_item = MediaPlaybackItem(source);
+				IVectorView<TimedMetadataTrack> tracks = media_item.TimedMetadataTracks();
+
+				for (size_t index = 0; index < tracks.Size(); index++) {
+					TimedMetadataTrack track = tracks.GetAt(index);
+
+					if (track.TimedMetadataKind() == TimedMetadataKind::Speech) {
+						track.CueEntered([this, utterance_id](TimedMetadataTrack const &sender, MediaCueEventArgs const &args) {
+							SpeechCue cue = args.Cue().as<SpeechCue>();
+							if (cue != nullptr) {
+								hstring cue_type = sender.Label();
+
+								if (cue_type == L"SpeechWord") {
+									int position_in_input = cue.StartPositionInInput().as<int>();
+									DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_BOUNDARY, utterance_id, position_in_input);
+								}
+							}
+						});
+
+						media_item.TimedMetadataTracks().SetPresentationMode(index, TimedMetadataTrackPresentationMode::Hidden);
+					}
+				}
+
+				media_player.Source(media_item);
+				media_player.Play();
+				DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_STARTED, pending_utterance_id);
+			}
+		});
+
+		queue.pop_front();
+	}
 }
 
 TTS_Windows *TTS_Windows::get_singleton() {
 	return singleton;
 }
 
+bool TTS_Windows::is_ssml(DisplayServer::TTSUtterance &message) const {
+	// Checks for the "<speak" tag at the start of the text, which should be true for all
+	// valid SSML 1.0 strings. Doesn't check if the full string is valid SSML 1.0 according
+	// to WinRT, so messages that pass this test can still fail to be synthesized.
+	String text = message.text.strip_edges(true, false).substr(0, 6).to_lower();
+	return text == "<speak";
+}
+
 TTS_Windows::TTS_Windows() {
 	singleton = this;
 
-	if (SUCCEEDED(CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice, (void **)&synth))) {
-		ULONGLONG event_mask = SPFEI(SPEI_END_INPUT_STREAM) | SPFEI(SPEI_START_INPUT_STREAM) | SPFEI(SPEI_WORD_BOUNDARY);
-		synth->SetInterest(event_mask, event_mask);
-		synth->SetNotifyCallbackFunction(&speech_event_callback, (WPARAM)(this), 0);
-		print_verbose("Text-to-Speech: SAPI initialized.");
-	} else {
-		print_verbose("Text-to-Speech: Cannot initialize ISpVoice!");
+	pending_utterance_id = NO_UTTERANCE_ID;
+
+	synthesizer = SpeechSynthesizer();
+	if (synthesizer == nullptr) {
+		print_verbose("Text-to-Speech: Cannot initialize ISpeechSynthesizer!");
+		return;
 	}
+
+	media_player = MediaPlayer();
+	if (media_player == nullptr) {
+		print_verbose("Text-to-Speech: Cannot initialize MediaPlayer!");
+		return;
+	}
+
+	synthesizer.Options().IncludeWordBoundaryMetadata(true);
+	synthesizer.Options().IncludeSentenceBoundaryMetadata(false);
+
+	media_player.MediaEnded([this](MediaPlayer const &sender, IInspectable const &) {
+		if (pending_utterance_id != NO_UTTERANCE_ID) {
+			DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_ENDED, pending_utterance_id);
+			pending_utterance_id = NO_UTTERANCE_ID;
+		}
+	});
+	media_player.MediaFailed([this](MediaPlayer const &sender, MediaPlayerFailedEventArgs const &args) {
+		if (pending_utterance_id != NO_UTTERANCE_ID) {
+			DisplayServer::get_singleton()->tts_post_utterance_event(DisplayServer::TTS_UTTERANCE_CANCELED, pending_utterance_id);
+			pending_utterance_id = NO_UTTERANCE_ID;
+		}
+	});
+
+	print_verbose("Text-to-Speech: ISpeechSynthesizer initialized.");
 }
 
 TTS_Windows::~TTS_Windows() {
-	if (synth) {
-		synth->Release();
-	}
+	stop();
+	media_player.Close();
+	synthesizer.Close();
 	singleton = nullptr;
 }

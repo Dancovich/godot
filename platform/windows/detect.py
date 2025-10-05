@@ -407,6 +407,7 @@ def configure_msvc(env: "SConsEnvironment"):
         "dwrite",
         "wbemuuid",
         "ntdll",
+        "runtimeobject",
     ]
 
     if env.debug_features:
@@ -424,7 +425,6 @@ def configure_msvc(env: "SConsEnvironment"):
             LIBS += [
                 "accesskit",
                 "uiautomationcore",
-                "runtimeobject",
                 "propsys",
                 "oleaut32",
                 "user32",
